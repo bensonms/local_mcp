@@ -1,14 +1,27 @@
 import express, { Request, Response } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
-import { MCPServer as MCPSDKServer, MCPServerConfig, MCPMessage, MCPResponse } from '@modelcontextprotocol/sdk';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Implementation, JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+
+// Add global error handlers
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    process.exit(1);
+});
 
 class MCPServer {
     private app: express.Application;
     private server: http.Server;
     private wss: WebSocketServer;
-    private mcpServer: MCPSDKServer;
+    private mcpServer: McpServer;
     private port: number;
+    private transport?: Transport;
 
     constructor(port: number = 3000) {
         this.port = port;
@@ -16,16 +29,23 @@ class MCPServer {
         this.server = http.createServer(this.app);
         this.wss = new WebSocketServer({ server: this.server });
         
-        const config: MCPServerConfig = {
+        const serverInfo: Implementation = {
             name: 'Basic MCP Server',
-            version: '1.0.0',
-            capabilities: ['text', 'chat'],
-            supportedProtocols: ['websocket'],
-            maxContextLength: 4096,
-            maxTokens: 2048
+            version: '1.0.0'
         };
         
-        this.mcpServer = new MCPSDKServer(config);
+        try {
+            this.mcpServer = new McpServer(serverInfo, {
+                capabilities: {
+                    text: {},
+                    chat: {}
+                }
+            });
+            console.log('MCP Server initialized successfully');
+        } catch (error) {
+            console.error('Failed to initialize MCP Server:', error);
+            throw error;
+        }
         
         this.setupRoutes();
         this.setupWebSocket();
@@ -39,44 +59,67 @@ class MCPServer {
 
         // MCP server info endpoint
         this.app.get('/info', (req: Request, res: Response) => {
-            res.json(this.mcpServer.getServerInfo());
+            try {
+                const info = this.mcpServer.server.getClientCapabilities();
+                res.json(info);
+            } catch (error) {
+                console.error('Error getting server info:', error);
+                res.status(500).json({ error: 'Failed to get server info' });
+            }
         });
     }
 
     private setupWebSocket(): void {
-        this.wss.on('connection', (ws: WebSocket) => {
+        this.wss.on('connection', async (ws: WebSocket) => {
             console.log('New client connected');
 
-            ws.on('message', async (message: string) => {
-                try {
-                    const mcpMessage: MCPMessage = JSON.parse(message);
-                    const response = await this.handleMessage(mcpMessage);
-                    ws.send(JSON.stringify(response));
-                } catch (error) {
-                    console.error('Error handling message:', error);
-                    ws.send(JSON.stringify({
-                        type: 'error',
-                        payload: { message: 'Error processing request' }
-                    }));
-                }
-            });
+            try {
+                // Create a transport for this WebSocket connection
+                const transport: Transport = {
+                    onmessage: undefined,
+                    onclose: () => {
+                        console.log('WebSocket connection closed');
+                    },
+                    onerror: (error: Error) => {
+                        console.error('WebSocket error:', error);
+                    },
+                    send: async (message: JSONRPCMessage) => {
+                        ws.send(JSON.stringify(message));
+                    },
+                    start: async () => {
+                        // Nothing to do here since WebSocket is already started
+                    },
+                    close: async () => {
+                        ws.close();
+                    },
+                    sessionId: crypto.randomUUID()
+                };
 
-            ws.on('close', () => {
-                console.log('Client disconnected');
-            });
+                // Connect the MCP server to this transport
+                await this.mcpServer.server.connect(transport);
+
+                // Set up WebSocket event handlers
+                ws.on('message', (data: Buffer) => {
+                    try {
+                        const message = JSON.parse(data.toString()) as JSONRPCMessage;
+                        transport.onmessage?.(message);
+                    } catch (error) {
+                        console.error('Error parsing message:', error);
+                    }
+                });
+
+                ws.on('close', () => {
+                    transport.onclose?.();
+                });
+
+                ws.on('error', (error) => {
+                    transport.onerror?.(error);
+                });
+            } catch (error) {
+                console.error('Error setting up WebSocket connection:', error);
+                ws.close();
+            }
         });
-    }
-
-    private async handleMessage(message: MCPMessage): Promise<MCPResponse> {
-        try {
-            return await this.mcpServer.handleMessage(message);
-        } catch (error) {
-            console.error('Error in message handler:', error);
-            return {
-                type: 'error',
-                payload: { message: 'Internal server error' }
-            };
-        }
     }
 
     public start(): void {
@@ -86,6 +129,11 @@ class MCPServer {
     }
 }
 
-// Start the server
-const server = new MCPServer(3000);
-server.start(); 
+// Start the server with error handling
+try {
+    const server = new MCPServer(3000);
+    server.start();
+} catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+} 
